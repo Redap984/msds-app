@@ -28,102 +28,88 @@ if db_file:
     else:
         st.sidebar.error("엑셀 파일 내에 'CAS'가 포함된 열 이름이 필요합니다.")
 
-# 2. MSDS 구성성분 추출 함수
+# 2. 강력한 MSDS 성분 추출 엔진
 def extract_composition_data(pdf_file):
     results = []
     has_trade_secret = False
     
     with pdfplumber.open(pdf_file) as pdf:
-        full_text = ""
-        table_found = False
+        all_pages_text = []
+        for p in pdf.pages:
+            txt = p.extract_text(layout=False) or ""
+            all_pages_text.append(txt)
+            
+        full_document = "\n---PAGE---\n".join(all_pages_text)
+
+        # 1. 영업비밀 키워드 탐색
+        if re.search(r'영업비밀|Trade\s*Secret', full_document, re.I):
+            has_trade_secret = True
+
+        # 2. '3. 구성성분...' 섹션만 정확히 잘라내기
+        sec3_match = re.search(
+            r'(?:3\s*[\.\,\)]\s*(?:구성\s*성분|혼합물의\s*구성|성분의\s*명칭|성분명칭).*?)(?=(?:4\s*[\.\,\)]\s*(?:응급|응급처치|응급조치))|\Z)', 
+            full_document, 
+            re.S | re.I
+        )
         
-        # 전체 텍스트 수집 및 영업비밀 키워드 확인
-        for page in pdf.pages:
-            t_text = page.extract_text() or ""
-            full_text += t_text + "\n"
+        target_chunk = sec3_match.group(0) if sec3_match else full_document
+        
+        # 3. 표 형태든 줄글이든 각 줄별로 정밀 분석
+        raw_lines = target_chunk.split('\n')
+        
+        for idx, line in enumerate(raw_lines):
+            line_str = line.strip()
+            cas_found = re.search(CAS_REGEX, line_str)
             
-            tables = page.extract_tables()
-            for tbl in tables:
-                if not tbl or len(tbl) < 2:
-                    continue
+            if cas_found:
+                cas_no = cas_found.group(0)
                 
-                tbl_flat = " ".join([str(c) for row in tbl for c in row if c])
-                if re.search(r'CAS', tbl_flat, re.I) and any(k in tbl_flat for k in ['성분', '함유', '물질명', '명칭']):
-                    cas_col_idx = -1
-                    name_col_idx = -1
-                    content_col_idx = -1
-                    
-                    for idx, col in enumerate(tbl[0]):
-                        col_clean = str(col).replace('\n', '').replace(' ', '').upper()
-                        if 'CAS' in col_clean:
-                            cas_col_idx = idx
-                        elif any(k in col_clean for k in ['함유', 'WT', '%', 'CONTENT', '농도']):
-                            content_col_idx = idx
-                        elif any(k in col_clean for k in ['물질명', '성분', 'NAME', '화학명', 'INGREDIENT']):
-                            if name_col_idx == -1:
-                                name_col_idx = idx
-
-                    for row in tbl[1:]:
-                        row_cells = [str(c).strip() if c is not None else "" for c in row]
-                        row_line = " ".join(row_cells)
-                        
-                        if '영업비밀' in row_line or 'Trade Secret' in row_line:
-                            has_trade_secret = True
-                            
-                        cas_match = re.search(CAS_REGEX, row_line)
-                        if cas_match:
-                            cas_no = cas_match.group(0)
-                            m_name = row_cells[name_col_idx].replace('\n', ' ').strip() if (name_col_idx != -1 and name_col_idx < len(row_cells)) else ""
-                            if not m_name and cas_col_idx > 0:
-                                m_name = row_cells[0].replace('\n', ' ').strip()
-                                
-                            cnt = row_cells[content_col_idx].replace('\n', ' ').strip() if (content_col_idx != -1 and content_col_idx < len(row_cells)) else ""
-                            if not cnt:
-                                remainder = row_line.replace(cas_no, '')
-                                c_match = re.search(r'(\d+(?:\.\d+)?(?:\s*\(.*?\))?%?|\d+\s*~\s*\d+%)', remainder)
-                                cnt = c_match.group(0) if c_match else "-"
-                                
-                            results.append({
-                                "구성성분명": m_name if m_name else "-",
-                                "CAS No.": cas_no,
-                                "함유량": cnt if cnt else "-"
-                            })
-                            table_found = True
-
-        if not table_found:
-            sec3_match = re.search(r'(3\.\s*구성\s*성분.*?)(?=4\.\s*응급|\Z)', full_text, re.S)
-            sec_text = sec3_match.group(1) if sec3_match else full_text
-            
-            if '영업비밀' in sec_text or 'Trade Secret' in sec_text:
-                has_trade_secret = True
+                # 라인 정리 (| 및 특수문자 제거)
+                cleaned_line = line_str.replace('|', ' ')
                 
-            lines = sec_text.split('\n')
-            for line in lines:
-                cas_match = re.search(CAS_REGEX, line)
-                if cas_match:
-                    cas_no = cas_match.group(0)
-                    if '|' in line:
-                        parts = [p.strip() for p in line.split('|') if p.strip()]
-                        m_name = parts[0] if parts else "-"
-                        cnt = parts[-1] if len(parts) >= 3 and parts[-1] != cas_no else "-"
-                    else:
-                        parts = line.split(cas_no)
-                        m_name = parts[0].strip()
-                        cnt = parts[1].strip() if len(parts) > 1 else "-"
-                    
-                    results.append({
-                        "구성성분명": m_name if m_name else "-",
-                        "CAS No.": cas_no,
-                        "함유량": cnt if cnt else "-"
-                    })
+                # CAS 번호 앞부분 -> 물질명 추정
+                parts = cleaned_line.split(cas_no)
+                before_cas = parts[0].strip()
+                after_cas = parts[1].strip() if len(parts) > 1 else ""
+                
+                # 성분명 추출 (헤더 단어 제외 필터링)
+                words_before = [w for w in before_cas.split() if w not in ['물질명', '이명', '관용명', '화학명', '성분', 'Name', 'CAS', 'CAS번호', 'CASNo']]
+                m_name = " ".join(words_before) if words_before else "-"
+                
+                # 만약 같은 줄 앞쪽에 성분명이 없고 윗줄에 성분명이 적혀 있는 경우
+                if (not m_name or m_name == "-") and idx > 0:
+                    prev_line = raw_lines[idx-1].replace('|', ' ').strip()
+                    prev_words = [w for w in prev_line.split() if not re.search(CAS_REGEX, w) and w not in ['물질명', '이명', '관용명', '구성성분']]
+                    if prev_words:
+                        m_name = " ".join(prev_words)
 
+                # 함유량 추출 (% 또는 숫자 패턴)
+                content = "-"
+                # 1순위: CAS 뒷부분에서 탐색
+                cnt_match = re.search(r'(\d+(?:\.\d+)?(?:\s*\(.*?\))?%?|\d+\s*~\s*\d+%)', after_cas)
+                if cnt_match:
+                    content = cnt_match.group(0).strip()
+                else:
+                    # 2순위: 전체 줄에서 CAS 제외 후 탐색
+                    rem = cleaned_line.replace(cas_no, '').replace(m_name, '')
+                    c_match2 = re.search(r'(\d+(?:\.\d+)?(?:\s*\(.*?\))?%?|\d+\s*~\s*\d+%)', rem)
+                    if c_match2:
+                        content = c_match2.group(0).strip()
+
+                results.append({
+                    "구성성분명": m_name if m_name else "-",
+                    "CAS No.": cas_no,
+                    "함유량": content if content else "-"
+                })
+
+    # 중복 제거 (등장 순서 보존)
     unique_results = []
-    seen = set()
+    seen_cas = set()
     for item in results:
-        if item["CAS No."] not in seen:
-            seen.add(item["CAS No."])
+        if item["CAS No."] not in seen_cas:
+            seen_cas.add(item["CAS No."])
             unique_results.append(item)
-            
+
     return unique_results, has_trade_secret
 
 # 3. 메인 화면 업로드 및 분석
@@ -168,22 +154,22 @@ if uploaded_pdfs:
 
     df_results = pd.DataFrame(all_rows)
     
-    # 4. 상단 요약 배너
+    # 4. 상단 알림
     st.subheader("📊 3. 분석 결과")
     if warning_count > 0:
-        st.warning(f"⚠️ **주의**: 3번 성분표가 누락되었거나 영업비밀로 표기된 파일이 **{warning_count}건** 발견되었습니다. 해당 품목은 공급처에 성분확인서(비함유증명서)를 별도 요청하세요.")
+        st.warning(f"⚠️ **주의**: 3번 성분표가 누락되었거나 영업비밀로 표기된 파일이 **{warning_count}건** 있습니다.")
     else:
-        st.success("✅ 모든 파일의 3번 구성성분 및 CAS No. 표가 정상 인식되었습니다.")
+        st.success("✅ 모든 파일의 3번 구성성분 및 CAS No. 표가 정상 분석되었습니다.")
 
-    # 5. 테이블 조건부 서식(색상 하이라이트) 함수
+    # 5. 색상 하이라이트
     def highlight_status(row):
         val = str(row['판정결과'])
         if '🚨' in val:
-            return ['background-color: #ffe6cc; color: #b35900; font-weight: bold;'] * len(row)  # 주황/노랑 (경고)
+            return ['background-color: #ffe6cc; color: #b35900; font-weight: bold;'] * len(row)
         elif '⚠️' in val:
-            return ['background-color: #ffcccc; color: #cc0000; font-weight: bold;'] * len(row)  # 붉은색 (유해물질)
+            return ['background-color: #ffcccc; color: #cc0000; font-weight: bold;'] * len(row)
         elif '정상' in val:
-            return ['background-color: #e6ffed; color: #155724;'] * len(row)  # 연초록 (정상)
+            return ['background-color: #e6ffed; color: #155724;'] * len(row)
         return [''] * len(row)
 
     styled_df = df_results.style.apply(highlight_status, axis=1)
