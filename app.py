@@ -6,7 +6,7 @@ import io
 
 st.set_page_config(page_title="MSDS 성분 분석기", layout="wide")
 st.title("🧪 MSDS 성분/함유량 추출 & 유해물질 판별 도구")
-st.write("MSDS 문서의 **3번 구성성분** 단락을 정밀 분석하여 물질명, CAS 번호, 함유량을 추출합니다.")
+st.write("MSDS 문서의 **3번 구성성분** 단락을 분석하여 물질명, CAS 번호, 함유량을 정확하게 추출합니다.")
 
 CAS_REGEX = r'\b[1-9]\d{1,6}-\d{2}-\d\b'
 
@@ -33,7 +33,6 @@ def extract_from_section_3(pdf_file):
     results = []
     
     with pdfplumber.open(pdf_file) as pdf:
-        # 전체 텍스트 수집
         raw_text_list = []
         for page in pdf.pages:
             t = page.extract_text() or ""
@@ -42,53 +41,68 @@ def extract_from_section_3(pdf_file):
         
     has_trade_secret = bool(re.search(r'영업비밀|Trade\s*Secret', full_text, re.I))
 
-    # [1단계] 3번 단락부터 4번 단락 전까지 본문 추출 (응급조치/응급처치 모두 대응)
+    # 3번 구성성분 단락 발췌
     sec3_match = re.search(r'(?:3\s*[\.\,\-\)]\s*구성\s*성분[\s\S]*?)(?=(?:4\s*[\.\,\-\)]\s*응급)|\Z)', full_text, re.I)
-    
     if sec3_match:
         section_text = sec3_match.group(0)
     else:
-        # 번호 없이 '구성성분'으로 시작하는 경우 백업
         sec3_match_bk = re.search(r'(?:구성\s*성분[\s\S]*?)(?=(?:응급\s*(?:조치|처치))|\Z)', full_text, re.I)
         section_text = sec3_match_bk.group(0) if sec3_match_bk else full_text
 
-    # [2단계] 단락 전체에서 CAS 번호 위치들을 모두 찾기
-    cas_matches = list(re.finditer(CAS_REGEX, section_text))
-    
+    # KE 번호 등 다른 식별번호를 임시 마스킹 처리하여 함유량 오인 방지 (예: KE-21487 -> KE_NUM)
+    clean_sec_text = re.sub(r'KE-\d+', 'KE_NUM', section_text)
+    clean_sec_text = re.sub(r'EC\s*No\.?\s*[\d\-]+', 'EC_NUM', clean_sec_text, flags=re.I)
+
+    cas_matches = list(re.finditer(CAS_REGEX, clean_sec_text))
     if not cas_matches:
         return [], has_trade_secret
 
-    # [3단계] 줄바꿈에 구애받지 않고 각 CAS 번호 주변의 이름과 함유량 매칭
     for i, match in enumerate(cas_matches):
         cas_no = match.group(0)
         start_idx = match.start()
         end_idx = match.end()
         
-        # 1) 성분명: 이전 CAS 끝지점(또는 섹션 시작점)부터 현재 CAS 시작점 사이의 텍스트
+        # 1) 구성성분명 파싱
         prev_end = cas_matches[i-1].end() if i > 0 else 0
-        before_text = section_text[prev_end:start_idx]
+        before_text = clean_sec_text[prev_end:start_idx]
         
-        # 이전 물질의 함유량(숫자)이나 테이블 헤더 단어들을 제외하고 성분명 추출
-        before_text_clean = before_text.replace('|', ' ').replace('\n', ' ')
+        before_text_clean = before_text.replace('|', ' ').replace('\n', ' ').replace('/', ' ')
         words = before_text_clean.split()
         
         filtered_words = []
         for w in words:
-            # 테이블 헤더 단어, 순수 숫자 제외
-            if w in ['3.', '구성성분', '명칭', '및', '함유량', '물질명', '이명(관용명)', '이명', '관용명', 'CAS', '번호', 'CAS번호', '함유량(%)', '%']:
+            if any(h in w for h in ['3.', '구성성분', '명칭', '함유량', '물질명', '이명', '관용명', '화학물질명', 'CAS', '번호', '식별번호', 'KE_NUM', 'EC_NUM', '%']):
                 continue
-            if re.match(r'^\d+(\.\d+)?%?$', w): # 숫자로만 된 것은 이전 항목의 함유량이므로 제외
+            # 순수 숫자나 범위 표현(이전 항목의 함유량)은 이름에서 제외
+            if re.match(r'^[<>]?\s*\d+(\.\d+)?(\s*[\~–\-]\s*\d+(\.\d+)?)?%?$', w):
                 continue
             filtered_words.append(w)
             
         comp_name = " ".join(filtered_words) if filtered_words else "-"
         
-        # 2) 함유량: 현재 CAS 끝지점부터 다음 CAS 시작지점(또는 텍스트 끝) 사이에서 첫 번째 숫자/퍼센트 추출
-        next_start = cas_matches[i+1].start() if i+1 < len(cas_matches) else len(section_text)
-        after_text = section_text[end_idx:next_start]
+        # 2) 함유량 파싱 (다음 CAS 번호 전까지의 텍스트 탐색)
+        next_start = cas_matches[i+1].start() if i+1 < len(cas_matches) else len(clean_sec_text)
+        after_text = clean_sec_text[end_idx:next_start]
         
-        cnt_match = re.search(r'(\d+(?:\.\d+)?(?:\s*\(.*?\))?%?|\d+\s*~\s*\d+%)', after_text)
-        content = cnt_match.group(0).strip() if cnt_match else "-"
+        # 함유량 정밀 패턴: 15~20, 5-10, 71, 12.5(10~15), < 5, 1 ~ 5 % 등
+        cnt_pattern = r'([<>]?\s*\d+(?:\.\d+)?\s*(?:[\~–\-]\s*\d+(?:\.\d+)?)?\s*(?:\(.*?\))?\s*%?)'
+        
+        content = "-"
+        # 줄 단위로 쪼개어 KE_NUM을 건너뛰고 함유량 타겟팅
+        for token in after_text.replace('|', ' ').split():
+            if 'KE_NUM' in token or 'EC_NUM' in token or token in ['/', '식별번호']:
+                continue
+            cnt_match = re.search(cnt_pattern, token)
+            if cnt_match and any(char.isdigit() for char in token):
+                content = token.strip()
+                break
+                
+        # 토큰 단위로 못 찾았을 경우 전체 문자열 패턴 매칭
+        if content == "-":
+            after_clean = re.sub(r'KE_NUM|EC_NUM|/', ' ', after_text)
+            fallback_match = re.search(r'([<>]?\s*\d+(?:\.\d+)?\s*[\~–\-]\s*\d+(?:\.\d+)?%?|\b\d+(?:\.\d+)?%?\b)', after_clean)
+            if fallback_match:
+                content = fallback_match.group(0).strip()
 
         results.append({
             "구성성분명": comp_name,
@@ -96,7 +110,7 @@ def extract_from_section_3(pdf_file):
             "함유량": content
         })
 
-    # CAS 기준 중복 제거
+    # CAS 중복 제거
     unique_results = []
     seen = set()
     for item in results:
