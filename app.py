@@ -6,11 +6,11 @@ import io
 
 st.set_page_config(page_title="MSDS 성분 분석기", layout="wide")
 st.title("🧪 MSDS 성분/함유량 추출 & 유해물질 판별 도구")
-st.write("MSDS 문서의 **3번 단락(구성성분)과 4번 단락(응급조치)** 사이 텍스트를 분석하여 성분명, CAS 번호, 함유량을 추출합니다.")
+st.write("MSDS 문서의 **3번 구성성분** 단락을 정밀 분석하여 물질명, CAS 번호, 함유량을 추출합니다.")
 
 CAS_REGEX = r'\b[1-9]\d{1,6}-\d{2}-\d\b'
 
-# 1. 사이드바: 유해물질 기준 DB 등록
+# 1. 유해물질 DB 등록
 st.sidebar.header("📁 1. 유해물질 기준 DB 등록")
 db_file = st.sidebar.file_uploader("유해물질 목록 엑셀 (.xlsx, .xls)", type=["xlsx", "xls"])
 
@@ -28,69 +28,75 @@ if db_file:
     else:
         st.sidebar.error("엑셀에 'CAS'가 포함된 열 이름이 필요합니다.")
 
-# 2. 단락(3번 ~ 4번 사이) 텍스트 분석 핵심 함수
+# 2. 3번 단락 집중 파싱 함수
 def extract_from_section_3(pdf_file):
     results = []
     
     with pdfplumber.open(pdf_file) as pdf:
-        # 전체 페이지의 텍스트를 하나의 본문으로 합치기
-        full_text = "\n".join([(page.extract_text() or "") for page in pdf.pages])
+        # 전체 텍스트 수집
+        raw_text_list = []
+        for page in pdf.pages:
+            t = page.extract_text() or ""
+            raw_text_list.append(t)
+        full_text = "\n".join(raw_text_list)
         
     has_trade_secret = bool(re.search(r'영업비밀|Trade\s*Secret', full_text, re.I))
 
-    # [핵심] '3. 구성성분...' 단락 시작부터 '4. 응급...' 단락 시작 직전까지만 추출
-    # 3. / 3 / 3- 형태 등 모든 단락 번호 표기 대응
-    sec3_pattern = r'(?:3\s*[\.\,\-\)]\s*구성\s*성분[\s\S]*?)(?=4\s*[\.\,\-\)]\s*응급|\Z)'
-    sec3_match = re.search(sec3_pattern, full_text, re.I)
+    # [1단계] 3번 단락부터 4번 단락 전까지 본문 추출 (응급조치/응급처치 모두 대응)
+    sec3_match = re.search(r'(?:3\s*[\.\,\-\)]\s*구성\s*성분[\s\S]*?)(?=(?:4\s*[\.\,\-\)]\s*응급)|\Z)', full_text, re.I)
     
-    # 3번 단락을 찾지 못했을 경우 백업: '구성성분의 명칭' 키워드부터 '응급' 키워드 전까지
-    if not sec3_match:
-        sec3_pattern_backup = r'(?:구성\s*성분[\s\S]*?)(?=응급\s*(?:조치|처치)|\Z)'
-        sec3_match = re.search(sec3_pattern_backup, full_text, re.I)
+    if sec3_match:
+        section_text = sec3_match.group(0)
+    else:
+        # 번호 없이 '구성성분'으로 시작하는 경우 백업
+        sec3_match_bk = re.search(r'(?:구성\s*성분[\s\S]*?)(?=(?:응급\s*(?:조치|처치))|\Z)', full_text, re.I)
+        section_text = sec3_match_bk.group(0) if sec3_match_bk else full_text
 
-    if not sec3_match:
+    # [2단계] 단락 전체에서 CAS 번호 위치들을 모두 찾기
+    cas_matches = list(re.finditer(CAS_REGEX, section_text))
+    
+    if not cas_matches:
         return [], has_trade_secret
 
-    section_text = sec3_match.group(0)
+    # [3단계] 줄바꿈에 구애받지 않고 각 CAS 번호 주변의 이름과 함유량 매칭
+    for i, match in enumerate(cas_matches):
+        cas_no = match.group(0)
+        start_idx = match.start()
+        end_idx = match.end()
+        
+        # 1) 성분명: 이전 CAS 끝지점(또는 섹션 시작점)부터 현재 CAS 시작점 사이의 텍스트
+        prev_end = cas_matches[i-1].end() if i > 0 else 0
+        before_text = section_text[prev_end:start_idx]
+        
+        # 이전 물질의 함유량(숫자)이나 테이블 헤더 단어들을 제외하고 성분명 추출
+        before_text_clean = before_text.replace('|', ' ').replace('\n', ' ')
+        words = before_text_clean.split()
+        
+        filtered_words = []
+        for w in words:
+            # 테이블 헤더 단어, 순수 숫자 제외
+            if w in ['3.', '구성성분', '명칭', '및', '함유량', '물질명', '이명(관용명)', '이명', '관용명', 'CAS', '번호', 'CAS번호', '함유량(%)', '%']:
+                continue
+            if re.match(r'^\d+(\.\d+)?%?$', w): # 숫자로만 된 것은 이전 항목의 함유량이므로 제외
+                continue
+            filtered_words.append(w)
+            
+        comp_name = " ".join(filtered_words) if filtered_words else "-"
+        
+        # 2) 함유량: 현재 CAS 끝지점부터 다음 CAS 시작지점(또는 텍스트 끝) 사이에서 첫 번째 숫자/퍼센트 추출
+        next_start = cas_matches[i+1].start() if i+1 < len(cas_matches) else len(section_text)
+        after_text = section_text[end_idx:next_start]
+        
+        cnt_match = re.search(r'(\d+(?:\.\d+)?(?:\s*\(.*?\))?%?|\d+\s*~\s*\d+%)', after_text)
+        content = cnt_match.group(0).strip() if cnt_match else "-"
 
-    # 3번 단락 안의 줄(Line)들을 순회하면서 CAS 번호와 성분명, 함유량 수집
-    lines = section_text.split('\n')
-    for line in lines:
-        cas_match = re.search(CAS_REGEX, line)
-        if cas_match:
-            cas_no = cas_match.group(0)
-            
-            # 특수문자 및 불필요한 공백 정리
-            clean_line = line.replace('|', ' ').replace('\t', ' ')
-            
-            # CAS 번호를 기준으로 앞부분(물질명 추정)과 뒷부분(함유량 추정) 분리
-            parts = clean_line.split(cas_no)
-            before = parts[0].strip()
-            after = parts[1].strip() if len(parts) > 1 else ""
-            
-            # 1) 구성성분명 정리 (테이블 헤더 단어 제외)
-            name_words = [w for w in before.split() if w not in ['물질명', '이명', '관용명', '화학명', '성분', 'Name', 'CAS', 'CAS번호', 'CASNo']]
-            comp_name = " ".join(name_words) if name_words else "-"
-            
-            # 2) 함유량 정리 (숫자, %, 괄호 범위 패턴 추출)
-            cnt = "-"
-            # CAS 뒷부분에서 먼저 검색 (예: 71, 12.5(10~15), 5~10% 등)
-            cnt_match = re.search(r'(\d+(?:\.\d+)?(?:\s*\(.*?\))?%?|\d+\s*~\s*\d+%)', after)
-            if cnt_match:
-                cnt = cnt_match.group(0).strip()
-            else:
-                # 뒷부분에 없으면 앞부분의 끝자리 숫자 검색
-                cnt_match2 = re.search(r'(\d+(?:\.\d+)?%?)$', before)
-                if cnt_match2:
-                    cnt = cnt_match2.group(0).strip()
+        results.append({
+            "구성성분명": comp_name,
+            "CAS No.": cas_no,
+            "함유량": content
+        })
 
-            results.append({
-                "구성성분명": comp_name,
-                "CAS No.": cas_no,
-                "함유량": cnt
-            })
-
-    # 중복 CAS 번호 제거
+    # CAS 기준 중복 제거
     unique_results = []
     seen = set()
     for item in results:
@@ -100,15 +106,15 @@ def extract_from_section_3(pdf_file):
 
     return unique_results, has_trade_secret
 
-# 3. 메인 화면: 파일 업로드 및 결과 도출
+# 3. 메인 화면
 st.subheader("📄 2. 검토할 MSDS PDF 파일 업로드")
-uploaded_pdfs = st.file_uploader("MSDS PDF 파일 업로드 (여러 개 동시 가능)", type=["pdf"], accept_multiple_files=True)
+uploaded_pdfs = st.file_uploader("MSDS PDF 파일 업로드 (여러 개 가능)", type=["pdf"], accept_multiple_files=True)
 
 if uploaded_pdfs:
     all_rows = []
     warning_count = 0
     
-    with st.spinner("MSDS 3번 단락 분석 중..."):
+    with st.spinner("MSDS 3번 단락 정밀 분석 중..."):
         for pdf_file in uploaded_pdfs:
             extracted_items, has_trade_secret = extract_from_section_3(pdf_file)
             
@@ -142,14 +148,13 @@ if uploaded_pdfs:
 
     df_results = pd.DataFrame(all_rows)
     
-    # 4. 상단 요약 알림
+    # 4. 결과 출력
     st.subheader("📊 3. 분석 결과")
     if warning_count > 0:
-        st.warning(f"⚠️ **주의**: 3번 단락에서 성분을 찾지 못했거나 영업비밀로 표기된 파일이 **{warning_count}건** 있습니다.")
+        st.warning(f"⚠️ **주의**: 3번 단락 성분을 추출하지 못했거나 영업비밀인 파일이 **{warning_count}건** 있습니다.")
     else:
-        st.success("✅ 모든 파일의 3번 단락 구성성분 분석이 완료되었습니다.")
+        st.success("✅ 3번 구성성분 분석이 성공적으로 완료되었습니다!")
 
-    # 5. 시각적 색상 하이라이트
     def highlight_status(row):
         val = str(row['판정결과'])
         if '🚨' in val:
@@ -163,14 +168,14 @@ if uploaded_pdfs:
     styled_df = df_results.style.apply(highlight_status, axis=1)
     st.dataframe(styled_df, use_container_width=True)
 
-    # 6. 엑셀 다운로드
+    # 5. 엑셀 다운로드
     buffer = io.BytesIO()
     with pd.ExcelWriter(buffer, engine='openpyxl') as writer:
-        df_results.to_excel(writer, index=False, sheet_name='MSDS단락검토결과')
+        df_results.to_excel(writer, index=False, sheet_name='MSDS검토결과')
     
     st.download_button(
         label="📥 결과 엑셀 파일 다운로드",
         data=buffer.getvalue(),
-        file_name="MSDS_단락분석_결과.xlsx",
+        file_name="MSDS_구성성분_추출결과.xlsx",
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
     )
