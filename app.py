@@ -53,7 +53,6 @@ if db_file:
             target_dict[cas_val] = f"[사내] {info}"
         st.sidebar.success(f"기준 DB 등록 완료: 총 {len(target_dict)}종 로드됨")
 
-# 화학식(C14H10O4, SiO2 등) 여부 검사
 def is_chemical_formula(val):
     v = val.strip()
     if re.search(r'[A-Za-z]', v) and any(c.isdigit() for c in v):
@@ -61,7 +60,7 @@ def is_chemical_formula(val):
             return True
     return False
 
-# 3. 전수 케이스 대응 파서 함수
+# 3. 에러 안전 파서 함수
 def extract_clean_components(pdf_file):
     results = []
     has_trade_secret = False
@@ -72,18 +71,19 @@ def extract_clean_components(pdf_file):
     if re.search(r'영업비밀|Trade\s*Secret', full_text, re.I):
         has_trade_secret = True
 
-    # 식별번호/노이즈 사전 마스킹
     clean_text = re.sub(r'KE-\d+', ' ', full_text)
     clean_text = re.sub(r'EC\s*No\.?\s*[\d\-]+', ' ', clean_text, flags=re.I)
     clean_text = re.sub(r'CAS\s*Number\s*:\s*', '', clean_text, flags=re.I)
 
-    # 3번 단락들 전수 발췌 (복수 키트 포함)
-    sec3_regex = r'(?:3(?:\.|\s*항목|\s*[\,\-\)])\s*(?:구성\s*성분|혼합물의\s*구성|킷\s*내용)[\s\S]*?)(?=(?:4(?:\.|\s*항목|\s*[\,\-\)])\s*응급|4\s*항목|\Z)'
-    sec3_chunks = [m.group(0) for m in re.finditer(sec3_regex, clean_text, re.I)]
+    # 3번 단락 추출 (정규식 괄호 에러 방지 처리)
+    sec3_regex = r'(?:3[.\s\-,)]*(?:구성\s*성분|혼합물의\s*구성|킷\s*내용)[\s\S]*?)(?=(?:4[.\s\-,)]*응급|4\s*항목|\Z))'
+    try:
+        sec3_chunks = [m.group(0) for m in re.finditer(sec3_regex, clean_text, re.I)]
+    except Exception:
+        sec3_chunks = []
     
     if not sec3_chunks:
-        # 단락 번호가 뭉개진 경우의 백업
-        sec3_fallback = re.search(r'(?:구성\s*성분[\s\S]*?)(?=응급\s*(?:조치|처치)|\Z)', clean_text, re.I)
+        sec3_fallback = re.search(r'(?:구성\s*성분[\s\S]*?)(?=응급|\Z)', clean_text, re.I)
         sec3_chunks = [sec3_fallback.group(0)] if sec3_fallback else [clean_text]
 
     for chunk in sec3_chunks:
@@ -96,7 +96,7 @@ def extract_clean_components(pdf_file):
             start_idx = match.start()
             end_idx = match.end()
 
-            # --- A. 물질명 추출 ---
+            # 물질명 추출
             prev_end = cas_matches[i-1].end() if i > 0 else 0
             before_str = chunk[prev_end:start_idx].replace('|', ' ').replace('/', ' ')
             words = before_str.split()
@@ -105,14 +105,13 @@ def extract_clean_components(pdf_file):
             for w in words:
                 if any(h in w for h in ['3.', '3항목', '구성성분', '명칭', '함유량', '물질명', '이명', '화학물질명', '식별번호', '제형', '%', '혼합물']):
                     continue
-                # 이전 물질의 함유량 수치 제외
                 if re.match(r'^[<>]?\s*\d+(\.\d+)?(\s*[\~–\-]\s*\d+(\.\d+)?)?%?$', w):
                     continue
                 clean_words.append(w)
             
             comp_name = " ".join(clean_words) if clean_words else "-"
 
-            # --- B. 함유량 추출 ---
+            # 함유량 추출
             next_start = cas_matches[i+1].start() if i+1 < len(cas_matches) else len(chunk)
             after_str = chunk[end_idx:next_start].replace('|', ' ')
             tokens = after_str.split()
@@ -125,7 +124,6 @@ def extract_clean_components(pdf_file):
                 if t in ['/', '유해화학물질', '번호:-', '-']:
                     continue
                 
-                # 순수 백분율/범위 표현 포착 (예: 10-15%, 15~20, 12.5(10~15), 71 등)
                 cnt_m = re.search(r'([<>]?\s*\d+(?:\.\d+)?\s*(?:[\~–\-]\s*\d+(?:\.\d+)?)?(?:\(.*?\))?\s*%?)', t)
                 if cnt_m and any(c.isdigit() for c in t):
                     content = cnt_m.group(0).strip()
@@ -137,7 +135,6 @@ def extract_clean_components(pdf_file):
                 "함유량": content
             })
 
-    # 중복 CAS 제거
     unique_items = []
     seen = set()
     for item in results:
